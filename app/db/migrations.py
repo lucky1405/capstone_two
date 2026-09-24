@@ -82,6 +82,30 @@ CREATE TABLE IF NOT EXISTS usage_alerts (
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS background_jobs (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT,
+    job_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 3,
+    last_error TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS job_failure_alerts (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    tenant_id TEXT,
+    job_type TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'CRITICAL',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (job_id) REFERENCES background_jobs(id) ON DELETE CASCADE
+);
+
 -- Index optimization for fast multi-tenant quota aggregations & queries
 CREATE INDEX IF NOT EXISTS idx_usage_events_tenant_time ON usage_events (tenant_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_usage_events_type ON usage_events (tenant_id, usage_type, created_at);
@@ -89,6 +113,8 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_idemp ON usage_events (tenant_id, id
 CREATE INDEX IF NOT EXISTS idx_subscriptions_tenant ON subscriptions (tenant_id);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_stripe_sub ON subscriptions (stripe_subscription_id);
 CREATE INDEX IF NOT EXISTS idx_idempotency_lookup ON idempotency_keys (tenant_id, idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_background_jobs_status ON background_jobs (status, job_type);
+CREATE INDEX IF NOT EXISTS idx_failure_alerts_job ON job_failure_alerts (job_id);
 """
 
 

@@ -197,8 +197,22 @@ The billing engine delegates payment custody entirely to Stripe Test Mode, maint
 
 ---
 
-## 8. Background Jobs & Resilience
+## 8. Background Jobs & Resilience (Shared Requirement 3)
 
-A dedicated background worker runs independently of the request path:
-1. **Reconciliation Job**: Periodically audits tenant subscription states against Stripe's subscription records to heal any missed webhook events, utilizing retry mechanisms with backoff.
-2. **Threshold Alert Dispatcher**: Monitors tenant month-to-date usage and logs/dispatches alert events when tenants cross 80% and 100% of their quotas.
+The architecture strictly decouples all heavy computation, bulk auditing, and notification delivery completely off the client HTTP request path using `FastAPI.BackgroundTasks` and `BillingBackgroundWorker`.
+
+### 8.1 Job Lifecycle & Persistence
+1. **Registration**: When a billable request arrives, the critical path (idempotency check, quota boundary check, usage event write) completes in under 2ms.
+2. **Asynchronous Hand-off**: The request queues post-metering work into `background_jobs` (`id`, `tenant_id`, `job_type`, `status='pending'`, `attempts=0`, `max_retries=3`).
+3. **Execution Off Request Path**: The background worker computes multi-event aggregations and quota threshold evaluations (80% and 100%).
+4. **Transient Error Retries**: If external dependencies (e.g. Stripe API, notification webhooks) experience network errors or timeouts:
+   - The worker catches the failure, increments `attempts`, and waits with exponential backoff:
+     $$\Delta t = 0.05 \cdot 2^{(\text{attempt} - 1)}\text{ seconds}$$
+   - The task retries up to `max_retries`.
+5. **Failure Alerting on Exhaustion**:
+   - If all retries fail, status transitions to `failed` and `last_error` is recorded.
+   - The worker emits a structured `[CRITICAL FAILURE ALERT]` log.
+   - A persistent failure alert row is inserted into `job_failure_alerts` with severity `CRITICAL`.
+   - The caller's HTTP response was already returned safely and was completely protected from background failures.
+6. **Bulk Operations**:
+   - Bulk subscription reconciliation is triggered via `POST /jobs/reconcile`, returning `202 Accepted` immediately while the worker audits Stripe state in the background.

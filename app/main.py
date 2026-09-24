@@ -1,7 +1,8 @@
 """Main FastAPI application entrypoint with lifecycle hooks and global error handlers."""
 import logging
+from typing import Optional
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, Request, status, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 
@@ -17,6 +18,7 @@ from app.core.errors import (
 )
 from app.api import meter, usage, billing, webhooks
 from app.services.background_jobs import (
+    BillingBackgroundWorker,
     BillingReconciliationJob,
     QuotaAlertDispatcherJob,
 )
@@ -165,8 +167,62 @@ async def trigger_reconciliation():
     return job_result.to_dict()
 
 
-@app.post("/admin/alerts/evaluate", tags=["System"])
-async def trigger_alert_evaluation():
-    """Triggers the background quota alert evaluation job (80% and 100% checks)."""
-    job_result = await QuotaAlertDispatcherJob.evaluate_and_dispatch_alerts()
-    return job_result.to_dict()
+@app.post("/jobs/reconcile", status_code=status.HTTP_202_ACCEPTED, tags=["System"])
+async def enqueue_reconciliation_job(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    tenant_id: Optional[str] = None,
+):
+    """
+    Enqueues bulk reconciliation audit completely OFF the request path.
+    Returns HTTP 202 Accepted immediately.
+    """
+    simulate_fail = bool(
+        request.headers.get("X-Simulate-Job-Fail") == "1"
+        or request.query_params.get("simulate_job_fail") == "1"
+    )
+    background_tasks.add_task(
+        BillingBackgroundWorker.process_stripe_reconciliation_background,
+        tenant_id=tenant_id,
+        simulate_fail=simulate_fail,
+    )
+    return {
+        "status": "queued",
+        "message": "Bulk reconciliation audit enqueued off the request path.",
+        "tenant_id": tenant_id,
+    }
+
+
+@app.get("/admin/jobs/failures", tags=["System"])
+async def list_failure_alerts():
+    """Returns all critical failure alerts dispatched by exhausted background jobs."""
+    from app.db.connection import get_db_connection
+    async with get_db_connection() as conn:
+        cursor = await conn.execute(
+            """
+            SELECT id, job_id, tenant_id, job_type, error_message, severity, created_at
+            FROM job_failure_alerts
+            ORDER BY created_at DESC
+            """
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+@app.get("/admin/jobs/{job_id}", tags=["System"])
+async def get_job_status(job_id: str):
+    """Inspects the execution state of an asynchronous background job."""
+    from app.db.connection import get_db_connection
+    async with get_db_connection() as conn:
+        cursor = await conn.execute(
+            """
+            SELECT id, tenant_id, job_type, status, attempts, max_retries, last_error, created_at, updated_at
+            FROM background_jobs
+            WHERE id = ?
+            """,
+            (job_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "job_not_found"})
+        return dict(row)

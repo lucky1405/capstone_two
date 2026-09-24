@@ -181,9 +181,16 @@ curl -X POST http://localhost:8000/checkout/create-session \
   -d '{"plan_id": "pro"}'
 ```
 
-### 4. Background Auditing & Resilience
-- **Reconciliation Audit Job**: `POST /admin/reconcile` (Syncs local subscriptions against Stripe source-of-truth with exponential retries).
-- **Quota Alert Dispatcher Job**: `POST /admin/alerts/evaluate` (Identifies and alerts on tenants at $\ge 80\%$ and $100\%$ quota).
+### 4. Background Auditing & Resilience (Shared Requirement 3)
+The system decouples all slow and bulk workloads completely off the client HTTP request path using `FastAPI.BackgroundTasks` and `BillingBackgroundWorker`:
+- **Off-Request Path Execution**: Metering requests return in under 2ms; cumulative aggregations, threshold evaluations (80% and 100%), and notifications execute asynchronously in the background.
+- **Persistent Job State**: Every job is registered in `background_jobs` (`id`, `tenant_id`, `job_type`, `status`, `attempts`, `max_retries`).
+- **Retries with Exponential Backoff**: Transient failures automatically retry up to `max_retries` with exponential delay (`0.05 * 2^(attempt-1)`).
+- **Failure Alerting**: If all retries are exhausted, the worker logs `[CRITICAL FAILURE ALERT]`, persists a failure record in `job_failure_alerts`, and never degrades the main HTTP response.
+- **Bulk Reconciliation Endpoint**: `POST /jobs/reconcile` returns `202 Accepted` immediately, running subscription audits in the background.
+- **Inspection Endpoints**:
+  - `GET /admin/jobs/{job_id}`: Query background job status, attempt count, and last error.
+  - `GET /admin/jobs/failures`: Inspect all active critical failure alerts.
 
 ---
 

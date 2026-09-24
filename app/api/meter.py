@@ -2,7 +2,7 @@
 import json
 import logging
 from typing import Optional
-from fastapi import APIRouter, Depends, Header, Request, Response
+from fastapi import APIRouter, Depends, Header, Request, Response, BackgroundTasks
 import aiosqlite
 
 from app.api.deps import get_db, resolve_tenant_id
@@ -16,6 +16,7 @@ from app.models.schemas import (
 )
 from app.services.meter_service import MeterService
 from app.services.quota_service import QuotaService
+from app.services.background_jobs import BillingBackgroundWorker
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ async def record_usage_event(
     request: Request,
     response: Response,
     payload: UsageRecordRequest,
+    background_tasks: BackgroundTasks,
     db: aiosqlite.Connection = Depends(get_db),
     tenant_id: str = Depends(resolve_tenant_id),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
@@ -38,6 +40,7 @@ async def record_usage_event(
     """
     Records consumption of API calls or AI tokens.
     Guarantees exactly-once processing using the 'Idempotency-Key' header.
+    Slow bulk aggregation & quota threshold evaluations run off the request path.
     """
     raw_body = await request.body()
     request_hash = (
@@ -59,6 +62,19 @@ async def record_usage_event(
         request_hash=request_hash,
     )
 
+    # Offload slow/bulk aggregation and alert evaluation off the HTTP request path
+    if not is_replay:
+        simulate_fail = bool(
+            request.headers.get("X-Simulate-Job-Fail") == "1"
+            or request.query_params.get("simulate_job_fail") == "1"
+        )
+        background_tasks.add_task(
+            BillingBackgroundWorker.process_usage_event_background,
+            tenant_id=tenant_id,
+            event_id=result.get("event_id", ""),
+            simulate_fail=simulate_fail,
+        )
+
     response.headers["X-Usage-Event-Id"] = result.get("event_id", "")
     response.headers["X-Idempotent-Replay"] = "true" if is_replay else "false"
     return result
@@ -73,6 +89,7 @@ async def generate_completion(
     request: Request,
     response: Response,
     payload: GenerateRequest,
+    background_tasks: BackgroundTasks,
     db: aiosqlite.Connection = Depends(get_db),
     tenant_id: str = Depends(resolve_tenant_id),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
@@ -84,6 +101,7 @@ async def generate_completion(
     - Pre-action quota check (API calls and AI tokens)
     - Pinned pricing math including cached input and reasoning tokens
     - Idempotent request replay without double charging
+    - Offloading slow rollup & threshold alerts to background worker
     """
     raw_body = await request.body()
     request_hash = (
@@ -124,6 +142,19 @@ async def generate_completion(
         idempotency_key=idempotency_key,
         request_hash=request_hash,
     )
+
+    # Offload background tasks off request path
+    if not is_replay:
+        simulate_fail = bool(
+            request.headers.get("X-Simulate-Job-Fail") == "1"
+            or request.query_params.get("simulate_job_fail") == "1"
+        )
+        background_tasks.add_task(
+            BillingBackgroundWorker.process_usage_event_background,
+            tenant_id=tenant_id,
+            event_id=meter_result["event_id"],
+            simulate_fail=simulate_fail,
+        )
 
     token_breakdown = get_token_breakdown_dict(
         input_tokens=input_tokens,
