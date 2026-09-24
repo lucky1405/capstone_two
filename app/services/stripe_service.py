@@ -38,7 +38,7 @@ class StripeService:
 
         price_id = settings.PLANS.get(plan_id, {}).get("stripe_price_id") or "price_pro_monthly_test"
 
-        if "MockTest" in settings.STRIPE_SECRET_KEY or "placeholder" in settings.STRIPE_SECRET_KEY or settings.APP_ENV == "test":
+        if not settings.STRIPE_SECRET_KEY.startswith("sk_test_") or "placeholder" in settings.STRIPE_SECRET_KEY or settings.APP_ENV == "test":
             mock_session_id = f"cs_test_{tenant_id}_{int(datetime.now(timezone.utc).timestamp())}"
             return {
                 "session_id": mock_session_id,
